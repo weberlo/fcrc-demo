@@ -10,6 +10,7 @@ from tvm import relay
 import tvm.micro as micro
 from tvm.relay.testing import resnet
 import matplotlib.pyplot as plt
+import warnings
 
 model_name = "lenet"
 
@@ -27,8 +28,8 @@ batch_size = 64
 train_data = gluon.data.DataLoader(gluon.data.vision.MNIST(train=True).transform_first(transforms.ToTensor()),
                                    batch_size, shuffle=True)
 
-# Build a simple convolutional network
 def build_lenet(net):
+    """Build a simple convolutional network"""
     with net.name_scope():
         # First convolution
         net.add(gluon.nn.Conv2D(channels=5, kernel_size=5, activation='relu'))
@@ -44,8 +45,9 @@ def build_lenet(net):
         net.add(gluon.nn.Dense(num_outputs))
         return net
 
-# Train a given model using MNIST data
+
 def train_model(model):
+    """Train a given model using MNIST data"""
     # Initialize the parameters with Xavier initializer
     model.collect_params().initialize(mx.init.Xavier(), ctx=ctx)
     # Use cross entropy loss
@@ -77,33 +79,8 @@ def train_model(model):
                 print("Epoch: %d; Batch %d; Loss %f" % (epoch, batch_num, curr_loss))
 
 
-def verify_loaded_model(net):
-    """Run inference using ten random images.
-    Print both input and output of the model"""
-
-    def transform(data, label):
-        return data.astype(np.float32)/255.0, label.astype(np.float32)
-
-    # Load ten random images from the test dataset
-    sample_data = mx.gluon.data.DataLoader(mx.gluon.data.vision.MNIST(train=False, transform=transform),
-                                  10, shuffle=True)
-
-    for data, label in sample_data:
-        # Display the images
-        img = nd.transpose(data, (1,0,2,3))
-        img = nd.reshape(img, (28,10*28,1))
-        imtiles = nd.tile(img, (1,1,3))
-        plt.imshow(imtiles.asnumpy())
-        plt.savefig("test_data.png")
-
-        # Display the predictions
-        data = nd.transpose(data, (0, 3, 1, 2))
-        out = net(data.as_in_context(ctx))
-        predictions = nd.argmax(out, axis=1)
-        print('Model predictions: ', predictions.asnumpy())
-        break
-
 def get_sample_point():
+    """Grabs a single input/label pair from MNIST"""
     def transform(data, label):
         return data.astype(np.float32)/255.0, label.astype(np.float32)
 
@@ -122,29 +99,32 @@ def get_sample_point():
         label = int(label.asnumpy()[0])
         return data, label
 
+
 # lenet = build_lenet(gluon.nn.HybridSequential())
 # lenet.hybridize()
 # train_model(lenet)
 
 # lenet.export(model_name, epoch=1)
 
-import warnings
+# Import model
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
     lenet = gluon.nn.SymbolBlock.imports(f"{model_name}-symbol.json", ['data'], f"{model_name}-0001.params", ctx=ctx)
 
-# verify_loaded_model(deserialized_net)
-
+# Convert to Relay
 func, params = relay.frontend.from_mxnet(
     lenet, shape={"data": (1, 1, 28, 28)})
 
+# Grab an example
 image, label = get_sample_point()
 print()
 input('check "test_input.png"...')
 
+# Begin a session
 import time
 start_time = time.time()
 with micro.Session("openocd", "riscv64-unknown-elf-", port=6666) as sess:
+    # Build the function
     mod = sess.build(func, params=params)
     end_time = time.time()
     print(f'initialization took {end_time - start_time} seconds')
@@ -156,9 +136,10 @@ with micro.Session("openocd", "riscv64-unknown-elf-", port=6666) as sess:
     print(f'model execution took {end_time - start_time} seconds')
     print()
 
-    # Get outputs.
+    # Get output
     tvm_output = mod.get_output(0)
 
+    # Check prediction
     print(f'expected label: {label}')
     prediction_idx = np.argmax(tvm_output.asnumpy()[0])
     print(f'actual label: {prediction_idx}')

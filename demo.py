@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 import warnings
 
 model_name = "lenet"
+# Set to true if you want to train before inference
+should_train = False
 
 # Use GPU if one exists, else use CPU
 ctx = mx.gpu() if mx.context.num_gpus() else mx.cpu()
@@ -100,13 +102,80 @@ def get_sample_point():
         return data, label
 
 
-# lenet = build_lenet(gluon.nn.HybridSequential())
-# lenet.hybridize()
-# train_model(lenet)
+def create_micro_mod(c_mod, toolchain_prefix):
+    """Produces a micro module from a given module.
 
-# lenet.export(model_name, epoch=1)
+    Parameters
+    ----------
+    c_mod : tvm.module.Module
+        module with "c" as its target backend
+
+    toolchain_prefix : str
+        toolchain prefix to be used (see `tvm.micro.Session` docs)
+
+    Return
+    ------
+    micro_mod : tvm.module.Module
+        micro module for the target device
+    """
+    temp_dir = util.tempdir()
+    lib_obj_path = temp_dir.relpath("dev_lib.obj")
+    c_mod.export_library(
+            lib_obj_path,
+            fcompile=tvm.micro.cross_compiler(toolchain_prefix=toolchain_prefix))
+    micro_mod = tvm.module.load(lib_obj_path, "micro_dev")
+    return micro_mod
+
+
+def relay_micro_build(func, toolchain_prefix, params=None):
+    """Create a graph runtime module with a micro device context from a Relay function.
+
+    Parameters
+    ----------
+    func : relay.Function
+        function to compile
+
+    params : dict
+        input parameters that do not change during inference
+
+    Return
+    ------
+    mod : tvm.module.Module
+        graph runtime module for the target device
+    """
+    with tvm.build_config(disable_vectorize=True):
+        graph, c_mod, params = relay.build(func, target="c", params=params)
+    micro_mod = create_micro_mod(c_mod, toolchain_prefix)
+    ctx = tvm.micro_dev(0)
+    mod = graph_runtime.create(graph, micro_mod, ctx)
+    mod.set_input(**params)
+    return mod
+
+
+print("""
+|--------------------------------------------------------------------------------------------------------------------------------------|
+|   _____ _               _  __       _               _____  _       _ _                       _____  _____  _____  _____   __      __ |
+|  / ____| |             (_)/ _|     (_)             |  __ \(_)     (_) |                     |  __ \|_   _|/ ____|/ ____|  \ \    / / |
+| | |    | | __ _ ___ ___ _| |_ _   _ _ _ __   __ _  | |  | |_  __ _ _| |_ ___    ___  _ __   | |__) | | | | (___ | |   _____\ \  / /  |
+| | |    | |/ _` / __/ __| |  _| | | | | '_ \ / _` | | |  | | |/ _` | | __/ __|  / _ \| '_ \  |  _  /  | |  \___ \| |  |______\ \/ /   |
+| | |____| | (_| \__ \__ \ | | | |_| | | | | | (_| | | |__| | | (_| | | |_\__ \ | (_) | | | | | | \ \ _| |_ ____) | |____      \  /    |
+|  \_____|_|\__,_|___/___/_|_|  \__, |_|_| |_|\__, | |_____/|_|\__, |_|\__|___/  \___/|_| |_| |_|  \_\_____|_____/ \_____|      \/     |
+|                                __/ |         __/ |            __/ |                                                                  |
+|                               |___/         |___/            |___/                                                                   |
+|--------------------------------------------------------------------------------------------------------------------------------------|
+""")
+
+input('Press enter to continue ')
+print()
+
+if should_train:
+    lenet = build_lenet(gluon.nn.HybridSequential())
+    lenet.hybridize()
+    train_model(lenet)
+    lenet.export(model_name, epoch=1)
 
 # Import model
+print("[Import Model]")
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
     lenet = gluon.nn.SymbolBlock.imports(f"{model_name}-symbol.json", ['data'], f"{model_name}-0001.params", ctx=ctx)
@@ -114,32 +183,55 @@ with warnings.catch_warnings():
 # Convert to Relay
 func, params = relay.frontend.from_mxnet(
     lenet, shape={"data": (1, 1, 28, 28)})
+func_str = str(func)
+print("  " + func_str.replace("\n", "\n  "))
+print()
+input('  Press enter to continue ')
+print()
 
 # Grab an example
+print("[Test Input]")
 image, label = get_sample_point()
+input('  Check "test_input.png"...')
 print()
-input('check "test_input.png"...')
 
 # Begin a session
 import time
+print("[Initialization]")
 start_time = time.time()
-with micro.Session("openocd", "riscv64-unknown-elf-", port=6666) as sess:
-    # Build the function
-    mod = sess.build(func, params=params)
+RISCV_TOOLCHAIN_PREFIX = "riscv64-unknown-elf-"
+with micro.Session("openocd", RISCV_TOOLCHAIN_PREFIX, base_addr=0x10010000, server_addr="127.0.0.1", port=6666) as sess:
     end_time = time.time()
-    print(f'initialization took {end_time - start_time} seconds')
+    print(f'  Initialization took {end_time - start_time} seconds')
+    print()
+    input('  Press enter to continue ')
+    print()
 
+    # Build the function
+    print("[Building]")
     start_time = time.time()
+    mod = relay_micro_build(func, RISCV_TOOLCHAIN_PREFIX, params=params)
+    end_time = time.time()
+    print(f'  Build took {end_time - start_time} seconds')
+    print()
+    input('  Press enter to continue ')
+    print()
+
     # Execute with `image` as the input.
+    print("[Executing]")
+    start_time = time.time()
     mod.run(data=image)
     end_time = time.time()
-    print(f'model execution took {end_time - start_time} seconds')
+    print(f'  Model execution took {end_time - start_time} seconds')
+    print()
+    input('  Press enter to continue ')
     print()
 
     # Get output
     tvm_output = mod.get_output(0)
 
     # Check prediction
-    print(f'expected label: {label}')
+    print("[Moment of Truth]")
+    print(f'  Expected label: {label}')
     prediction_idx = np.argmax(tvm_output.asnumpy()[0])
-    print(f'actual label: {prediction_idx}')
+    print(f'  Actual label: {prediction_idx}')
